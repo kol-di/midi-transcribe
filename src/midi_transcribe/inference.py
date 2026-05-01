@@ -14,6 +14,10 @@ def build_model_from_checkpoint(checkpoint_path: Path, device: torch.device) -> 
     model_name = str(model_cfg.get("model_name", "mlp_baseline"))
     hidden_dim = int(model_cfg.get("hidden_dim", model_cfg.get("head_hidden", 512)))
     use_temporal_convs = bool(model_cfg.get("use_temporal_convs", False))
+    rnn_type = str(model_cfg.get("rnn_type", "lstm"))
+    rnn_hidden_size = int(model_cfg.get("rnn_hidden_size", 128))
+    rnn_num_layers = int(model_cfg.get("rnn_num_layers", 1))
+    rnn_bidirectional = bool(model_cfg.get("rnn_bidirectional", True))
 
     model = create_model(
         model_name=model_name,
@@ -21,6 +25,10 @@ def build_model_from_checkpoint(checkpoint_path: Path, device: torch.device) -> 
         output_dim=88,
         hidden_dim=hidden_dim,
         use_temporal_convs=use_temporal_convs,
+        rnn_type=rnn_type,
+        rnn_hidden_size=rnn_hidden_size,
+        rnn_num_layers=rnn_num_layers,
+        rnn_bidirectional=rnn_bidirectional,
     ).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()

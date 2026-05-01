@@ -25,15 +25,24 @@ from midi_transcribe.visualization import save_prediction_figure
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train CNN onset+frame baseline")
+    parser = argparse.ArgumentParser(description="Train onset+frame CNN/CRNN baseline")
     parser.add_argument("--data-root", required=True, help="Precomputed onsets+frames dataset root")
     parser.add_argument("--run-dir", required=True, help="Run directory")
+    parser.add_argument(
+        "--model-name",
+        choices=["cnn_onsets_frames", "crnn_onsets_frames"],
+        default="cnn_onsets_frames",
+    )
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=24)
     parser.add_argument("--segment-frames", type=int, default=512)
     parser.add_argument("--segment-stride", type=int, default=512)
     parser.add_argument("--head-hidden", type=int, default=256)
     parser.add_argument("--use-temporal-convs", action="store_true")
+    parser.add_argument("--rnn-type", choices=["lstm", "gru"], default="lstm")
+    parser.add_argument("--rnn-hidden-size", type=int, default=128)
+    parser.add_argument("--rnn-num-layers", type=int, default=1)
+    parser.add_argument("--rnn-bidirectional", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--onset-loss-weight", type=float, default=1.0)
@@ -202,11 +211,15 @@ def main() -> int:
     ).to(device)
 
     model = create_model(
-        model_name="cnn_onsets_frames",
+        model_name=args.model_name,
         input_dim=128,
         output_dim=88,
         hidden_dim=args.head_hidden,
         use_temporal_convs=args.use_temporal_convs,
+        rnn_type=args.rnn_type,
+        rnn_hidden_size=args.rnn_hidden_size,
+        rnn_num_layers=args.rnn_num_layers,
+        rnn_bidirectional=args.rnn_bidirectional,
     ).to(device)
 
     frame_criterion = nn.BCEWithLogitsLoss(reduction="none", pos_weight=frame_weight)
@@ -216,13 +229,17 @@ def main() -> int:
 
     run_config = {
         "data_root": str(data_root),
-        "model_name": "cnn_onsets_frames",
+        "model_name": args.model_name,
         "epochs": args.epochs,
         "batch_size": args.batch_size,
         "segment_frames": args.segment_frames,
         "segment_stride": args.segment_stride,
         "head_hidden": args.head_hidden,
         "use_temporal_convs": args.use_temporal_convs,
+        "rnn_type": args.rnn_type,
+        "rnn_hidden_size": args.rnn_hidden_size,
+        "rnn_num_layers": args.rnn_num_layers,
+        "rnn_bidirectional": args.rnn_bidirectional,
         "lr": args.lr,
         "weight_decay": args.weight_decay,
         "onset_loss_weight": args.onset_loss_weight,

@@ -17,7 +17,7 @@ from midi_transcribe.data import (
     iterate_onsets_frames_batches,
     list_pt_files,
 )
-from midi_transcribe.eval import evaluate_onsets_frames_split
+from midi_transcribe.eval import evaluate_onsets_frames_split, evaluate_onsets_frames_threshold_grid
 from midi_transcribe.metrics import decode_onsets_frames, onsets_frames_loss
 from midi_transcribe.model import create_model
 from midi_transcribe.visualization import save_prediction_figure
@@ -37,6 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--onset-loss-weight", type=float, default=1.0)
     parser.add_argument("--frame-threshold", type=float, default=0.5)
     parser.add_argument("--onset-threshold", type=float, default=0.5)
+    parser.add_argument("--threshold-grid", type=str, default="0.4,0.5,0.6")
     parser.add_argument("--frame-pos-weight", type=float, default=None)
     parser.add_argument("--onset-pos-weight", type=float, default=None)
     parser.add_argument("--max-batches-for-pos-weight", type=int, default=64)
@@ -60,6 +61,13 @@ def summarize_weight(weight: torch.Tensor) -> Dict[str, Any]:
         "max": float(weight.max().item()),
         "values": [float(x) for x in weight.cpu().tolist()],
     }
+
+
+def parse_threshold_values(raw: str) -> List[float]:
+    values = [float(x.strip()) for x in raw.split(",") if x.strip()]
+    if not values:
+        raise ValueError("--threshold-grid must contain at least one value")
+    return values
 
 
 def estimate_pos_weights(
@@ -216,6 +224,7 @@ def main() -> int:
         "onset_loss_weight": args.onset_loss_weight,
         "frame_threshold": args.frame_threshold,
         "onset_threshold": args.onset_threshold,
+        "threshold_grid": parse_threshold_values(args.threshold_grid),
         "max_batches_for_pos_weight": args.max_batches_for_pos_weight,
         "frame_pos_weight": summarize_weight(frame_weight.detach().cpu()),
         "onset_pos_weight": summarize_weight(onset_weight.detach().cpu()),
@@ -334,6 +343,31 @@ def main() -> int:
         artifacts_dir / "final_model.pt",
     )
 
+    best_checkpoint = torch.load(artifacts_dir / "best_model.pt", map_location=device)
+    model.load_state_dict(best_checkpoint["model_state_dict"])
+    model.eval()
+
+    threshold_values = parse_threshold_values(args.threshold_grid)
+    threshold_pairs = [(f, o) for f in threshold_values for o in threshold_values]
+    threshold_search_results = evaluate_onsets_frames_threshold_grid(
+        model=model,
+        files=val_files,
+        device=device,
+        batch_size=args.batch_size,
+        segment_frames=args.segment_frames,
+        segment_stride=args.segment_stride,
+        threshold_pairs=threshold_pairs,
+    )
+    best_thresholds = threshold_search_results[0]
+    (artifacts_dir / "threshold_search_val.json").write_text(
+        json.dumps(threshold_search_results, indent=2),
+        encoding="utf-8",
+    )
+    (artifacts_dir / "best_thresholds.json").write_text(
+        json.dumps(best_thresholds, indent=2),
+        encoding="utf-8",
+    )
+
     test_metrics = evaluate_onsets_frames_split(
         model=model,
         files=test_files,
@@ -344,12 +378,13 @@ def main() -> int:
         frame_criterion=frame_criterion,
         onset_criterion=onset_criterion,
         onset_loss_weight=args.onset_loss_weight,
-        frame_threshold=args.frame_threshold,
-        onset_threshold=args.onset_threshold,
+        frame_threshold=best_thresholds["frame_threshold"],
+        onset_threshold=best_thresholds["onset_threshold"],
     )
     metrics_test = {
         "test": test_metrics,
         "best_val_frame_f1": best_val_frame_f1,
+        "best_thresholds": best_thresholds,
         "total_train_time_sec": time.time() - start_time,
     }
     (artifacts_dir / "metrics_test.json").write_text(
@@ -364,8 +399,8 @@ def main() -> int:
             device=device,
             output_dir=artifacts_dir,
             segment_frames=args.segment_frames,
-            frame_threshold=args.frame_threshold,
-            onset_threshold=args.onset_threshold,
+            frame_threshold=best_thresholds["frame_threshold"],
+            onset_threshold=best_thresholds["onset_threshold"],
         )
     except Exception as exc:
         print(f"[warn] failed to generate prediction preview: {exc}", flush=True)

@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, Iterable, List
 
 import torch
 import torch.nn as nn
@@ -169,3 +169,77 @@ def evaluate_onsets_frames_split(
             prefix="decoded_frame_",
         ),
     }
+
+
+@torch.no_grad()
+def evaluate_onsets_frames_threshold_grid(
+    model: nn.Module,
+    files: List[Path],
+    device: torch.device,
+    batch_size: int,
+    segment_frames: int,
+    segment_stride: int,
+    threshold_pairs: Iterable[tuple[float, float]],
+) -> List[Dict[str, float]]:
+    model.eval()
+    pairs = list(threshold_pairs)
+    counts = {
+        pair: {
+            "frame": [0.0, 0.0, 0.0],
+            "onset": [0.0, 0.0, 0.0],
+            "decoded_frame": [0.0, 0.0, 0.0],
+        }
+        for pair in pairs
+    }
+
+    for xb, frame_yb, onset_yb, mb in iterate_onsets_frames_batches(
+        files=files,
+        batch_size=batch_size,
+        segment_frames=segment_frames,
+        segment_stride=segment_stride,
+        shuffle_files=False,
+    ):
+        xb = xb.to(device, non_blocking=True)
+        frame_yb = frame_yb.to(device, non_blocking=True)
+        onset_yb = onset_yb.to(device, non_blocking=True)
+        mb = mb.to(device, non_blocking=True)
+        valid = mb.unsqueeze(-1)
+
+        with torch.amp.autocast("cuda", dtype=torch.float16):
+            outputs = model(xb)
+
+        frame_probs = torch.sigmoid(outputs["frame_logits"])
+        onset_probs = torch.sigmoid(outputs["onset_logits"])
+
+        for frame_threshold, onset_threshold in pairs:
+            frame_preds = (frame_probs >= frame_threshold).float()
+            onset_preds = (onset_probs >= onset_threshold).float()
+            decoded_frame_preds = decode_onsets_frames(
+                onset_probs=onset_probs,
+                frame_probs=frame_probs,
+                onset_threshold=onset_threshold,
+                frame_threshold=frame_threshold,
+            )
+
+            for name, preds, targets in (
+                ("frame", frame_preds, frame_yb),
+                ("onset", onset_preds, onset_yb),
+                ("decoded_frame", decoded_frame_preds, frame_yb),
+            ):
+                tp, fp, fn = micro_counts(preds, targets, valid)
+                counts[(frame_threshold, onset_threshold)][name][0] += tp
+                counts[(frame_threshold, onset_threshold)][name][1] += fp
+                counts[(frame_threshold, onset_threshold)][name][2] += fn
+
+    results = []
+    for frame_threshold, onset_threshold in pairs:
+        rec: Dict[str, float] = {
+            "frame_threshold": frame_threshold,
+            "onset_threshold": onset_threshold,
+        }
+        for prefix in ("frame", "onset", "decoded_frame"):
+            tp, fp, fn = counts[(frame_threshold, onset_threshold)][prefix]
+            rec.update(prf_from_counts(tp, fp, fn, prefix=f"{prefix}_"))
+        results.append(rec)
+
+    return sorted(results, key=lambda x: x["decoded_frame_f1_micro"], reverse=True)

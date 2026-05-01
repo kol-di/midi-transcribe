@@ -110,6 +110,72 @@ class ConvContextModel(nn.Module):
         return z.reshape(bsz, timesteps, -1)  # [B, T, 88]
 
 
+class CNNOnsetFrameBaseline(nn.Module):
+    """Compact onset+frame CNN baseline that preserves temporal resolution."""
+
+    def __init__(
+        self,
+        out_keys: int = 88,
+        hidden_channels: int = 96,
+        pooled_freq_bands: int = 8,
+        head_hidden: int = 256,
+        dropout: float = 0.2,
+        detach_onset_for_frame: bool = True,
+    ) -> None:
+        super().__init__()
+        self.pooled_freq_bands = pooled_freq_bands
+        self.detach_onset_for_frame = detach_onset_for_frame
+
+        self.encoder = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=(2, 1), stride=(2, 1)),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=(2, 1), stride=(2, 1)),
+            nn.Conv2d(64, hidden_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(hidden_channels),
+            nn.ReLU(inplace=True),
+        )
+
+        feature_dim = hidden_channels * pooled_freq_bands
+        self.onset_head = nn.Sequential(
+            nn.Linear(feature_dim, head_hidden),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(head_hidden, out_keys),
+        )
+        self.frame_head = nn.Sequential(
+            nn.Linear(feature_dim + out_keys, head_hidden),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(head_hidden, out_keys),
+        )
+
+    def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        # x: [B, T, F] -> [B, 1, F, T]
+        x = x.transpose(1, 2).unsqueeze(1)
+
+        h = self.encoder(x)  # [B, C, F_reduced, T]
+        h = nn.functional.adaptive_avg_pool2d(h, (self.pooled_freq_bands, h.shape[-1]))
+        h = h.permute(0, 3, 1, 2).contiguous()  # [B, T, C, F_reduced]
+        features = h.flatten(start_dim=2)  # [B, T, D]
+
+        onset_logits = self.onset_head(features)
+        onset_probs = torch.sigmoid(onset_logits)
+        if self.detach_onset_for_frame:
+            onset_probs = onset_probs.detach()
+
+        frame_input = torch.cat([features, onset_probs], dim=-1)
+        frame_logits = self.frame_head(frame_input)
+        return {
+            "onset_logits": onset_logits,
+            "frame_logits": frame_logits,
+        }
+
+
 def create_model(
     model_name: str,
     input_dim: int = 128,
@@ -124,5 +190,14 @@ def create_model(
             output_dim=output_dim,
             context_frames=5,
             dense_dim=hidden_dim,
+        )
+    if model_name == "cnn_onsets_frames":
+        return CNNOnsetFrameBaseline(
+            out_keys=output_dim,
+            hidden_channels=96,
+            pooled_freq_bands=8,
+            head_hidden=hidden_dim,
+            dropout=0.2,
+            detach_onset_for_frame=True,
         )
     raise ValueError(f"Unknown model_name: {model_name}")

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import re
 from pathlib import Path
 
 import torch
@@ -31,7 +32,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def parse_threshold_values(raw: str) -> list[float]:
-    values = [float(x.strip()) for x in raw.split(",") if x.strip()]
+    values = [float(x.strip()) for x in re.split(r"[,:;\s]+", raw) if x.strip()]
     if not values:
         raise ValueError("--threshold-grid must contain at least one value")
     return values
@@ -49,7 +50,6 @@ def main() -> int:
     onset_criterion = nn.BCEWithLogitsLoss(reduction="none", pos_weight=onset_weight)
 
     best_thresholds = None
-    threshold_search = None
     frame_threshold = args.frame_threshold
     onset_threshold = args.onset_threshold
 
@@ -95,7 +95,6 @@ def main() -> int:
         "onset_threshold": onset_threshold,
         "optimized_on": args.optimize_thresholds_on,
         "best_thresholds": best_thresholds,
-        "threshold_search": threshold_search,
         "metrics": metrics,
     }
     output_path = Path(args.output_path)

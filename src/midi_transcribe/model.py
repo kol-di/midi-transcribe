@@ -121,10 +121,12 @@ class CNNOnsetFrameBaseline(nn.Module):
         head_hidden: int = 256,
         dropout: float = 0.2,
         detach_onset_for_frame: bool = True,
+        use_temporal_convs: bool = False,
     ) -> None:
         super().__init__()
         self.pooled_freq_bands = pooled_freq_bands
         self.detach_onset_for_frame = detach_onset_for_frame
+        self.use_temporal_convs = use_temporal_convs
 
         self.encoder = nn.Sequential(
             nn.Conv2d(1, 32, kernel_size=3, padding=1),
@@ -136,6 +138,35 @@ class CNNOnsetFrameBaseline(nn.Module):
             nn.ReLU(inplace=True),
             nn.MaxPool2d(kernel_size=(2, 1), stride=(2, 1)),
             nn.Conv2d(64, hidden_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(hidden_channels),
+            nn.ReLU(inplace=True),
+        )
+        self.temporal_convs = nn.Sequential(
+            nn.Conv2d(
+                hidden_channels,
+                hidden_channels,
+                kernel_size=(1, 3),
+                padding=(0, 1),
+                dilation=(1, 1),
+            ),
+            nn.BatchNorm2d(hidden_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(
+                hidden_channels,
+                hidden_channels,
+                kernel_size=(1, 3),
+                padding=(0, 2),
+                dilation=(1, 2),
+            ),
+            nn.BatchNorm2d(hidden_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(
+                hidden_channels,
+                hidden_channels,
+                kernel_size=(1, 3),
+                padding=(0, 4),
+                dilation=(1, 4),
+            ),
             nn.BatchNorm2d(hidden_channels),
             nn.ReLU(inplace=True),
         )
@@ -159,6 +190,8 @@ class CNNOnsetFrameBaseline(nn.Module):
         x = x.transpose(1, 2).unsqueeze(1)
 
         h = self.encoder(x)  # [B, C, F_reduced, T]
+        if self.use_temporal_convs:
+            h = self.temporal_convs(h)
         h = nn.functional.adaptive_avg_pool2d(h, (self.pooled_freq_bands, h.shape[-1]))
         h = h.permute(0, 3, 1, 2).contiguous()  # [B, T, C, F_reduced]
         features = h.flatten(start_dim=2)  # [B, T, D]
@@ -181,6 +214,7 @@ def create_model(
     input_dim: int = 128,
     output_dim: int = 88,
     hidden_dim: int = 512,
+    use_temporal_convs: bool = False,
 ) -> nn.Module:
     if model_name == "mlp_baseline":
         return TemporalMLP(input_dim=input_dim, hidden_dim=hidden_dim, output_dim=output_dim)
@@ -199,5 +233,6 @@ def create_model(
             head_hidden=hidden_dim,
             dropout=0.2,
             detach_onset_for_frame=True,
+            use_temporal_convs=use_temporal_convs,
         )
     raise ValueError(f"Unknown model_name: {model_name}")

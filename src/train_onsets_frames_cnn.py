@@ -4,6 +4,7 @@ import json
 import math
 import os
 import random
+import re
 import sys
 import time
 from pathlib import Path
@@ -32,12 +33,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--segment-frames", type=int, default=512)
     parser.add_argument("--segment-stride", type=int, default=512)
     parser.add_argument("--head-hidden", type=int, default=256)
+    parser.add_argument("--use-temporal-convs", action="store_true")
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--onset-loss-weight", type=float, default=1.0)
     parser.add_argument("--frame-threshold", type=float, default=0.5)
     parser.add_argument("--onset-threshold", type=float, default=0.5)
-    parser.add_argument("--threshold-grid", type=str, default="0.4,0.5,0.6")
+    parser.add_argument("--threshold-grid", type=str, default="0.3,0.4,0.5,0.6")
     parser.add_argument("--frame-pos-weight", type=float, default=None)
     parser.add_argument("--onset-pos-weight", type=float, default=None)
     parser.add_argument("--max-batches-for-pos-weight", type=int, default=64)
@@ -64,7 +66,7 @@ def summarize_weight(weight: torch.Tensor) -> Dict[str, Any]:
 
 
 def parse_threshold_values(raw: str) -> List[float]:
-    values = [float(x.strip()) for x in raw.split(",") if x.strip()]
+    values = [float(x.strip()) for x in re.split(r"[,:;\s]+", raw) if x.strip()]
     if not values:
         raise ValueError("--threshold-grid must contain at least one value")
     return values
@@ -204,6 +206,7 @@ def main() -> int:
         input_dim=128,
         output_dim=88,
         hidden_dim=args.head_hidden,
+        use_temporal_convs=args.use_temporal_convs,
     ).to(device)
 
     frame_criterion = nn.BCEWithLogitsLoss(reduction="none", pos_weight=frame_weight)
@@ -219,6 +222,7 @@ def main() -> int:
         "segment_frames": args.segment_frames,
         "segment_stride": args.segment_stride,
         "head_hidden": args.head_hidden,
+        "use_temporal_convs": args.use_temporal_convs,
         "lr": args.lr,
         "weight_decay": args.weight_decay,
         "onset_loss_weight": args.onset_loss_weight,
@@ -359,10 +363,10 @@ def main() -> int:
         threshold_pairs=threshold_pairs,
     )
     best_thresholds = threshold_search_results[0]
-    (artifacts_dir / "threshold_search_val.json").write_text(
-        json.dumps(threshold_search_results, indent=2),
-        encoding="utf-8",
-    )
+    # (artifacts_dir / "threshold_search_val.json").write_text(
+    #     json.dumps(threshold_search_results, indent=2),
+    #     encoding="utf-8",
+    # )
     (artifacts_dir / "best_thresholds.json").write_text(
         json.dumps(best_thresholds, indent=2),
         encoding="utf-8",

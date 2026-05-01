@@ -13,12 +13,14 @@ def build_model_from_checkpoint(checkpoint_path: Path, device: torch.device) -> 
     model_cfg = checkpoint.get("config", {})
     model_name = str(model_cfg.get("model_name", "mlp_baseline"))
     hidden_dim = int(model_cfg.get("hidden_dim", model_cfg.get("head_hidden", 512)))
+    use_temporal_convs = bool(model_cfg.get("use_temporal_convs", False))
 
     model = create_model(
         model_name=model_name,
         input_dim=128,
         output_dim=88,
         hidden_dim=hidden_dim,
+        use_temporal_convs=use_temporal_convs,
     ).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()

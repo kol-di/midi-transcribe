@@ -16,6 +16,24 @@ def bce_masked_loss(
     return masked.sum() / max(denom, 1.0)
 
 
+def focal_masked_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    mask: torch.Tensor,
+    alpha_pos: torch.Tensor,
+    gamma: float,
+) -> torch.Tensor:
+    probs = torch.sigmoid(logits)
+    probs = probs.clamp(min=1e-6, max=1.0 - 1e-6)
+    alpha_pos = alpha_pos.view(1, 1, -1).to(device=logits.device, dtype=logits.dtype)
+    alpha_t = torch.where(targets == 1.0, alpha_pos, 1.0 - alpha_pos)
+    pt = torch.where(targets == 1.0, probs, 1.0 - probs)
+    per_elem = -alpha_t * torch.pow(1.0 - pt, gamma) * torch.log(pt)
+    masked = per_elem * mask.unsqueeze(-1)
+    denom = mask.sum() * logits.shape[-1]
+    return masked.sum() / max(denom, 1.0)
+
+
 def onsets_frames_loss(
     outputs: dict[str, torch.Tensor],
     frame_targets: torch.Tensor,
@@ -24,6 +42,9 @@ def onsets_frames_loss(
     frame_criterion: nn.Module,
     onset_criterion: nn.Module,
     onset_loss_weight: float,
+    onset_loss_type: str = "bce",
+    onset_focal_gamma: float = 2.0,
+    onset_focal_alpha_pos: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     frame_loss = bce_masked_loss(
         logits=outputs["frame_logits"],
@@ -31,12 +52,25 @@ def onsets_frames_loss(
         mask=mask,
         criterion=frame_criterion,
     )
-    onset_loss = bce_masked_loss(
-        logits=outputs["onset_logits"],
-        targets=onset_targets,
-        mask=mask,
-        criterion=onset_criterion,
-    )
+    if onset_loss_type == "bce":
+        onset_loss = bce_masked_loss(
+            logits=outputs["onset_logits"],
+            targets=onset_targets,
+            mask=mask,
+            criterion=onset_criterion,
+        )
+    elif onset_loss_type == "focal":
+        if onset_focal_alpha_pos is None:
+            raise ValueError("onset_focal_alpha_pos is required when onset_loss_type='focal'")
+        onset_loss = focal_masked_loss(
+            logits=outputs["onset_logits"],
+            targets=onset_targets,
+            mask=mask,
+            alpha_pos=onset_focal_alpha_pos,
+            gamma=onset_focal_gamma,
+        )
+    else:
+        raise ValueError(f"Unknown onset_loss_type: {onset_loss_type}")
     loss = frame_loss + onset_loss_weight * onset_loss
     return loss, {
         "loss": float(loss.item()),

@@ -259,16 +259,22 @@ class CRNNOnsetFrameBaseline(nn.Module):
         rnn_hidden_size: int = 128,
         rnn_num_layers: int = 1,
         rnn_bidirectional: bool = True,
+        onset_head_source: str = "rnn",
     ) -> None:
         super().__init__()
 
         if rnn_type not in {"lstm", "gru"}:
             raise ValueError(f"rnn_type must be 'lstm' or 'gru', got {rnn_type}")
+        if onset_head_source not in {"rnn", "features"}:
+            raise ValueError(
+                f"onset_head_source must be 'rnn' or 'features', got {onset_head_source}"
+            )
 
         self.pooled_freq_bands = pooled_freq_bands
         self.detach_onset_for_frame = detach_onset_for_frame
         self.rnn_type = rnn_type
         self.rnn_bidirectional = rnn_bidirectional
+        self.onset_head_source = onset_head_source
 
         self.encoder = CNNFrequencyEncoder(hidden_channels=hidden_channels)
 
@@ -296,8 +302,9 @@ class CRNNOnsetFrameBaseline(nn.Module):
         self.rnn_output_norm = nn.LayerNorm(rnn_output_dim)
         self.rnn_output_dropout = nn.Dropout(dropout)
 
+        onset_input_dim = rnn_output_dim if onset_head_source == "rnn" else feature_dim
         self.onset_head = nn.Sequential(
-            nn.Linear(rnn_output_dim, head_hidden),
+            nn.Linear(onset_input_dim, head_hidden),
             nn.ReLU(inplace=True),
             nn.Dropout(dropout),
             nn.Linear(head_hidden, out_keys),
@@ -321,12 +328,13 @@ class CRNNOnsetFrameBaseline(nn.Module):
         )  # [B, C, pooled_freq_bands, T]
         h = h.permute(0, 3, 1, 2).contiguous()  # [B, T, C, F_reduced]
         features = h.flatten(start_dim=2)  # [B, T, D]
-        features = self.input_projection(features)  # [B, T, rnn_input_dim]
+        rnn_input = self.input_projection(features)  # [B, T, rnn_input_dim]
 
-        rnn_features, _ = self.rnn(features)  # [B, T, H] or [B, T, 2H]
+        rnn_features, _ = self.rnn(rnn_input)  # [B, T, H] or [B, T, 2H]
         rnn_features = self.rnn_output_norm(self.rnn_output_dropout(rnn_features))
 
-        onset_logits = self.onset_head(rnn_features)  # [B, T, 88]
+        onset_input = rnn_features if self.onset_head_source == "rnn" else features
+        onset_logits = self.onset_head(onset_input)  # [B, T, 88]
         onset_probs = torch.sigmoid(onset_logits)
         if self.detach_onset_for_frame:
             onset_probs = onset_probs.detach()
@@ -352,6 +360,7 @@ def create_model(
     rnn_hidden_size: int = 128,
     rnn_num_layers: int = 1,
     rnn_bidirectional: bool = True,
+    crnn_onset_head_source: str = "rnn",
 ) -> nn.Module:
     if model_name == "mlp_baseline":
         return TemporalMLP(input_dim=input_dim, hidden_dim=hidden_dim, output_dim=output_dim)
@@ -385,5 +394,6 @@ def create_model(
             rnn_hidden_size=rnn_hidden_size,
             rnn_num_layers=rnn_num_layers,
             rnn_bidirectional=rnn_bidirectional,
+            onset_head_source=crnn_onset_head_source,
         )
     raise ValueError(f"Unknown model_name: {model_name}")

@@ -83,6 +83,9 @@ def evaluate_onsets_frames_split(
     onset_loss_weight: float,
     frame_threshold: float,
     onset_threshold: float,
+    onset_loss_type: str = "bce",
+    onset_focal_gamma: float = 2.0,
+    onset_focal_alpha_pos: torch.Tensor | None = None,
 ) -> Dict[str, float]:
     model.eval()
     total_loss = 0.0
@@ -122,6 +125,9 @@ def evaluate_onsets_frames_split(
                 frame_criterion=frame_criterion,
                 onset_criterion=onset_criterion,
                 onset_loss_weight=onset_loss_weight,
+                onset_loss_type=onset_loss_type,
+                onset_focal_gamma=onset_focal_gamma,
+                onset_focal_alpha_pos=onset_focal_alpha_pos,
             )
 
         total_loss += float(loss.item())

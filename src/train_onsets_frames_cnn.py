@@ -47,11 +47,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rnn-hidden-size", type=int, default=128)
     parser.add_argument("--rnn-num-layers", type=int, default=1)
     parser.add_argument("--rnn-bidirectional", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--crnn-onset-head-source", choices=["rnn", "features"], default="rnn")
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--use-lr-scheduler", action="store_true")
     parser.add_argument("--warmup-epochs", type=int, default=3)
+    parser.add_argument("--early-stopping-patience", type=int, default=0)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--onset-loss-weight", type=float, default=1.0)
+    parser.add_argument("--onset-loss-type", choices=["bce", "focal"], default="bce")
+    parser.add_argument("--onset-focal-gamma", type=float, default=2.0)
     parser.add_argument("--frame-threshold", type=float, default=0.5)
     parser.add_argument("--onset-threshold", type=float, default=0.5)
     parser.add_argument("--threshold-grid", type=str, default="0.3,0.4,0.5,0.6")
@@ -242,10 +246,12 @@ def main() -> int:
         rnn_hidden_size=args.rnn_hidden_size,
         rnn_num_layers=args.rnn_num_layers,
         rnn_bidirectional=args.rnn_bidirectional,
+        crnn_onset_head_source=args.crnn_onset_head_source,
     ).to(device)
 
     frame_criterion = nn.BCEWithLogitsLoss(reduction="none", pos_weight=frame_weight)
     onset_criterion = nn.BCEWithLogitsLoss(reduction="none", pos_weight=onset_weight)
+    onset_focal_alpha_pos = onset_weight / (1.0 + onset_weight)
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scaler = torch.amp.GradScaler("cuda")
 
@@ -295,6 +301,7 @@ def main() -> int:
         "rnn_hidden_size": args.rnn_hidden_size,
         "rnn_num_layers": args.rnn_num_layers,
         "rnn_bidirectional": args.rnn_bidirectional,
+        "crnn_onset_head_source": args.crnn_onset_head_source,
         "lr": args.lr,
         "lr_scheduler": {
             "enabled": args.use_lr_scheduler,
@@ -308,6 +315,16 @@ def main() -> int:
         },
         "weight_decay": args.weight_decay,
         "onset_loss_weight": args.onset_loss_weight,
+        "onset_loss_type": args.onset_loss_type,
+        "onset_focal_gamma": args.onset_focal_gamma,
+        "onset_focal_alpha_pos": summarize_weight(onset_focal_alpha_pos.detach().cpu())
+        if args.onset_loss_type == "focal"
+        else None,
+        "early_stopping": {
+            "enabled": args.early_stopping_patience > 0,
+            "monitor": "val_loss",
+            "patience": args.early_stopping_patience,
+        },
         "frame_threshold": args.frame_threshold,
         "onset_threshold": args.onset_threshold,
         "threshold_grid": parse_threshold_values(args.threshold_grid),
@@ -325,10 +342,15 @@ def main() -> int:
 
     val_log_path = artifacts_dir / "metrics_val_history.jsonl"
     best_val_frame_f1 = -math.inf
+    best_val_loss = math.inf
+    epochs_without_val_loss_improvement = 0
+    stopped_early = False
+    last_epoch = 0
     start_time = time.time()
 
     with val_log_path.open("w", encoding="utf-8") as val_log_f:
         for epoch in range(1, args.epochs + 1):
+            last_epoch = epoch
             model.train()
             lr_epoch_start = optimizer.param_groups[0]["lr"]
             epoch_loss = 0.0
@@ -360,6 +382,9 @@ def main() -> int:
                         frame_criterion=frame_criterion,
                         onset_criterion=onset_criterion,
                         onset_loss_weight=args.onset_loss_weight,
+                        onset_loss_type=args.onset_loss_type,
+                        onset_focal_gamma=args.onset_focal_gamma,
+                        onset_focal_alpha_pos=onset_focal_alpha_pos,
                     )
 
                 old_scale = scaler.get_scale()
@@ -387,7 +412,16 @@ def main() -> int:
                 onset_loss_weight=args.onset_loss_weight,
                 frame_threshold=args.frame_threshold,
                 onset_threshold=args.onset_threshold,
+                onset_loss_type=args.onset_loss_type,
+                onset_focal_gamma=args.onset_focal_gamma,
+                onset_focal_alpha_pos=onset_focal_alpha_pos,
             )
+            if val_metrics["loss"] < best_val_loss:
+                best_val_loss = val_metrics["loss"]
+                epochs_without_val_loss_improvement = 0
+            else:
+                epochs_without_val_loss_improvement += 1
+
             val_rec = {
                 "epoch": epoch,
                 "lr_epoch_start": lr_epoch_start,
@@ -395,6 +429,8 @@ def main() -> int:
                 "train_loss_mean": epoch_loss / max(epoch_batches, 1),
                 "train_frame_loss_mean": epoch_frame_loss / max(epoch_batches, 1),
                 "train_onset_loss_mean": epoch_onset_loss / max(epoch_batches, 1),
+                "best_val_loss": best_val_loss,
+                "epochs_without_val_loss_improvement": epochs_without_val_loss_improvement,
                 **val_metrics,
             }
             val_log_f.write(json.dumps(val_rec) + "\n")
@@ -430,6 +466,22 @@ def main() -> int:
                     artifacts_dir / "best_model.pt",
                 )
 
+            if (
+                args.early_stopping_patience > 0
+                and epochs_without_val_loss_improvement >= args.early_stopping_patience
+            ):
+                stopped_early = True
+                print(
+                    "early_stopping triggered at epoch={epoch} best_val_loss={best_val_loss:.6f} "
+                    "patience={patience}".format(
+                        epoch=epoch,
+                        best_val_loss=best_val_loss,
+                        patience=args.early_stopping_patience,
+                    ),
+                    flush=True,
+                )
+                break
+
     torch.save(
         {
             "model_state_dict": model.state_dict(),
@@ -437,7 +489,9 @@ def main() -> int:
             "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
             "config": run_config,
             "best_val_frame_f1": best_val_frame_f1,
-            "epochs_trained": args.epochs,
+            "best_val_loss": best_val_loss,
+            "epochs_trained": last_epoch,
+            "stopped_early": stopped_early,
         },
         artifacts_dir / "final_model.pt",
     )
@@ -479,11 +533,17 @@ def main() -> int:
         onset_loss_weight=args.onset_loss_weight,
         frame_threshold=best_thresholds["frame_threshold"],
         onset_threshold=best_thresholds["onset_threshold"],
+        onset_loss_type=args.onset_loss_type,
+        onset_focal_gamma=args.onset_focal_gamma,
+        onset_focal_alpha_pos=onset_focal_alpha_pos,
     )
     metrics_test = {
         "test": test_metrics,
         "best_val_frame_f1": best_val_frame_f1,
+        "best_val_loss": best_val_loss,
         "best_thresholds": best_thresholds,
+        "epochs_trained": last_epoch,
+        "stopped_early": stopped_early,
         "total_train_time_sec": time.time() - start_time,
     }
     (artifacts_dir / "metrics_test.json").write_text(

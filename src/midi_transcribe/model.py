@@ -255,6 +255,7 @@ class CRNNOnsetFrameBaseline(nn.Module):
         dropout: float = 0.2,
         detach_onset_for_frame: bool = True,
         rnn_type: str = "lstm",  # "lstm" or "gru"
+        rnn_input_dim: int = 256,
         rnn_hidden_size: int = 128,
         rnn_num_layers: int = 1,
         rnn_bidirectional: bool = True,
@@ -272,10 +273,18 @@ class CRNNOnsetFrameBaseline(nn.Module):
         self.encoder = CNNFrequencyEncoder(hidden_channels=hidden_channels)
 
         feature_dim = hidden_channels * pooled_freq_bands
+        projection_dropout = 0.1
+
+        self.input_projection = nn.Sequential(
+            nn.Linear(feature_dim, rnn_input_dim),
+            nn.LayerNorm(rnn_input_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(projection_dropout),
+        )
 
         rnn_cls = nn.LSTM if rnn_type == "lstm" else nn.GRU
         self.rnn = rnn_cls(
-            input_size=feature_dim,
+            input_size=rnn_input_dim,
             hidden_size=rnn_hidden_size,
             num_layers=rnn_num_layers,
             batch_first=True,
@@ -284,6 +293,8 @@ class CRNNOnsetFrameBaseline(nn.Module):
         )
 
         rnn_output_dim = rnn_hidden_size * (2 if rnn_bidirectional else 1)
+        self.rnn_output_norm = nn.LayerNorm(rnn_output_dim)
+        self.rnn_output_dropout = nn.Dropout(dropout)
 
         self.onset_head = nn.Sequential(
             nn.Linear(rnn_output_dim, head_hidden),
@@ -310,8 +321,10 @@ class CRNNOnsetFrameBaseline(nn.Module):
         )  # [B, C, pooled_freq_bands, T]
         h = h.permute(0, 3, 1, 2).contiguous()  # [B, T, C, F_reduced]
         features = h.flatten(start_dim=2)  # [B, T, D]
+        features = self.input_projection(features)  # [B, T, rnn_input_dim]
 
         rnn_features, _ = self.rnn(features)  # [B, T, H] or [B, T, 2H]
+        rnn_features = self.rnn_output_norm(self.rnn_output_dropout(rnn_features))
 
         onset_logits = self.onset_head(rnn_features)  # [B, T, 88]
         onset_probs = torch.sigmoid(onset_logits)
@@ -333,7 +346,9 @@ def create_model(
     output_dim: int = 88,
     hidden_dim: int = 512,
     use_temporal_convs: bool = False,
+    pooled_freq_bands: int = 8,
     rnn_type: str = "lstm",
+    rnn_input_dim: int = 256,
     rnn_hidden_size: int = 128,
     rnn_num_layers: int = 1,
     rnn_bidirectional: bool = True,
@@ -351,7 +366,7 @@ def create_model(
         return CNNOnsetFrameBaseline(
             out_keys=output_dim,
             hidden_channels=96,
-            pooled_freq_bands=8,
+            pooled_freq_bands=pooled_freq_bands,
             head_hidden=hidden_dim,
             dropout=0.2,
             detach_onset_for_frame=True,
@@ -361,11 +376,12 @@ def create_model(
         return CRNNOnsetFrameBaseline(
             out_keys=output_dim,
             hidden_channels=96,
-            pooled_freq_bands=8,
+            pooled_freq_bands=pooled_freq_bands,
             head_hidden=hidden_dim,
             dropout=0.2,
             detach_onset_for_frame=True,
             rnn_type=rnn_type,
+            rnn_input_dim=rnn_input_dim,
             rnn_hidden_size=rnn_hidden_size,
             rnn_num_layers=rnn_num_layers,
             rnn_bidirectional=rnn_bidirectional,

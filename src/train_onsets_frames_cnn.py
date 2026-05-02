@@ -17,6 +17,8 @@ import torch.optim as optim
 from midi_transcribe.data import (
     iterate_onsets_frames_batches,
     list_pt_files,
+    load_onsets_frames_piece,
+    segment_starts,
 )
 from midi_transcribe.eval import evaluate_onsets_frames_split, evaluate_onsets_frames_threshold_grid
 from midi_transcribe.metrics import decode_onsets_frames, onsets_frames_loss
@@ -38,12 +40,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--segment-frames", type=int, default=512)
     parser.add_argument("--segment-stride", type=int, default=512)
     parser.add_argument("--head-hidden", type=int, default=256)
+    parser.add_argument("--pooled-freq-bands", type=int, default=8)
     parser.add_argument("--use-temporal-convs", action="store_true")
     parser.add_argument("--rnn-type", choices=["lstm", "gru"], default="lstm")
+    parser.add_argument("--rnn-input-dim", type=int, default=256)
     parser.add_argument("--rnn-hidden-size", type=int, default=128)
     parser.add_argument("--rnn-num-layers", type=int, default=1)
     parser.add_argument("--rnn-bidirectional", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--use-lr-scheduler", action="store_true")
+    parser.add_argument("--warmup-epochs", type=int, default=3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--onset-loss-weight", type=float, default=1.0)
     parser.add_argument("--frame-threshold", type=float, default=0.5)
@@ -79,6 +85,20 @@ def parse_threshold_values(raw: str) -> List[float]:
     if not values:
         raise ValueError("--threshold-grid must contain at least one value")
     return values
+
+
+def count_onsets_frames_batches(
+    files: List[Path],
+    batch_size: int,
+    segment_frames: int,
+    segment_stride: int,
+) -> tuple[int, int]:
+    total_segments = 0
+    for path in files:
+        features, _, _ = load_onsets_frames_piece(path)
+        total_segments += len(segment_starts(features.shape[0], segment_frames, segment_stride))
+    total_batches = math.ceil(total_segments / batch_size)
+    return total_segments, total_batches
 
 
 def estimate_pos_weights(
@@ -216,7 +236,9 @@ def main() -> int:
         output_dim=88,
         hidden_dim=args.head_hidden,
         use_temporal_convs=args.use_temporal_convs,
+        pooled_freq_bands=args.pooled_freq_bands,
         rnn_type=args.rnn_type,
+        rnn_input_dim=args.rnn_input_dim,
         rnn_hidden_size=args.rnn_hidden_size,
         rnn_num_layers=args.rnn_num_layers,
         rnn_bidirectional=args.rnn_bidirectional,
@@ -227,6 +249,37 @@ def main() -> int:
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scaler = torch.amp.GradScaler("cuda")
 
+    train_segments, train_batches_per_epoch = count_onsets_frames_batches(
+        files=train_files,
+        batch_size=args.batch_size,
+        segment_frames=args.segment_frames,
+        segment_stride=args.segment_stride,
+    )
+    total_steps = args.epochs * train_batches_per_epoch
+    warmup_steps = min(args.warmup_epochs * train_batches_per_epoch, max(total_steps - 1, 1))
+    scheduler = None
+    if args.use_lr_scheduler:
+        if total_steps <= 0:
+            raise RuntimeError("Cannot create LR scheduler with zero training steps.")
+        if warmup_steps > 0:
+            warmup_scheduler = optim.lr_scheduler.LinearLR(
+                optimizer,
+                start_factor=0.1,
+                end_factor=1.0,
+                total_iters=warmup_steps,
+            )
+            cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=max(total_steps - warmup_steps, 1),
+            )
+            scheduler = optim.lr_scheduler.SequentialLR(
+                optimizer,
+                schedulers=[warmup_scheduler, cosine_scheduler],
+                milestones=[warmup_steps],
+            )
+        else:
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(total_steps, 1))
+
     run_config = {
         "data_root": str(data_root),
         "model_name": args.model_name,
@@ -235,12 +288,24 @@ def main() -> int:
         "segment_frames": args.segment_frames,
         "segment_stride": args.segment_stride,
         "head_hidden": args.head_hidden,
+        "pooled_freq_bands": args.pooled_freq_bands,
         "use_temporal_convs": args.use_temporal_convs,
         "rnn_type": args.rnn_type,
+        "rnn_input_dim": args.rnn_input_dim,
         "rnn_hidden_size": args.rnn_hidden_size,
         "rnn_num_layers": args.rnn_num_layers,
         "rnn_bidirectional": args.rnn_bidirectional,
         "lr": args.lr,
+        "lr_scheduler": {
+            "enabled": args.use_lr_scheduler,
+            "kind": "LinearLR+CosineAnnealingLR via SequentialLR" if args.use_lr_scheduler else None,
+            "warmup_epochs": args.warmup_epochs,
+            "warmup_steps": warmup_steps if args.use_lr_scheduler else 0,
+            "total_steps": total_steps,
+            "train_segments": train_segments,
+            "train_batches_per_epoch": train_batches_per_epoch,
+            "start_factor": 0.1 if args.use_lr_scheduler else None,
+        },
         "weight_decay": args.weight_decay,
         "onset_loss_weight": args.onset_loss_weight,
         "frame_threshold": args.frame_threshold,
@@ -265,6 +330,7 @@ def main() -> int:
     with val_log_path.open("w", encoding="utf-8") as val_log_f:
         for epoch in range(1, args.epochs + 1):
             model.train()
+            lr_epoch_start = optimizer.param_groups[0]["lr"]
             epoch_loss = 0.0
             epoch_frame_loss = 0.0
             epoch_onset_loss = 0.0
@@ -296,9 +362,13 @@ def main() -> int:
                         onset_loss_weight=args.onset_loss_weight,
                     )
 
+                old_scale = scaler.get_scale()
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
+                new_scale = scaler.get_scale()
+                if scheduler is not None and new_scale >= old_scale:
+                    scheduler.step()
 
                 epoch_loss += loss_parts["loss"]
                 epoch_frame_loss += loss_parts["frame_loss"]
@@ -320,6 +390,8 @@ def main() -> int:
             )
             val_rec = {
                 "epoch": epoch,
+                "lr_epoch_start": lr_epoch_start,
+                "lr_epoch_end": optimizer.param_groups[0]["lr"],
                 "train_loss_mean": epoch_loss / max(epoch_batches, 1),
                 "train_frame_loss_mean": epoch_frame_loss / max(epoch_batches, 1),
                 "train_onset_loss_mean": epoch_onset_loss / max(epoch_batches, 1),
@@ -329,9 +401,12 @@ def main() -> int:
             val_log_f.flush()
 
             print(
-                "epoch={epoch} train_loss={train_loss:.6f} val_frame_f1={frame_f1:.4f} "
+                "epoch={epoch} lr_start={lr_start:.6g} lr_end={lr_end:.6g} "
+                "train_loss={train_loss:.6f} val_frame_f1={frame_f1:.4f} "
                 "val_onset_f1={onset_f1:.4f} val_loss={val_loss:.6f} epoch_sec={sec:.1f}".format(
                     epoch=epoch,
+                    lr_start=val_rec["lr_epoch_start"],
+                    lr_end=val_rec["lr_epoch_end"],
                     train_loss=val_rec["train_loss_mean"],
                     frame_f1=val_metrics["frame_f1_micro"],
                     onset_f1=val_metrics["onset_f1_micro"],
@@ -348,6 +423,7 @@ def main() -> int:
                         "epoch": epoch,
                         "model_state_dict": model.state_dict(),
                         "optimizer_state_dict": optimizer.state_dict(),
+                        "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
                         "best_val_frame_f1": best_val_frame_f1,
                         "config": run_config,
                     },
@@ -357,6 +433,8 @@ def main() -> int:
     torch.save(
         {
             "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
             "config": run_config,
             "best_val_frame_f1": best_val_frame_f1,
             "epochs_trained": args.epochs,

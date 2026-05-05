@@ -6,12 +6,16 @@ import torch.nn as nn
 
 from .data import iterate_batches
 from .data import iterate_onsets_frames_batches
+from .data import iterate_state4_batches
 from .metrics import (
     bce_masked_loss,
     decode_onsets_frames,
     micro_counts,
     onsets_frames_loss,
     prf_from_counts,
+    state4_macro_f1,
+    state4_masked_cross_entropy_loss,
+    state4_metric_counts,
 )
 
 
@@ -249,3 +253,67 @@ def evaluate_onsets_frames_threshold_grid(
         results.append(rec)
 
     return sorted(results, key=lambda x: x["decoded_frame_f1_micro"], reverse=True)
+
+
+@torch.no_grad()
+def evaluate_state4_split(
+    model: nn.Module,
+    files: List[Path],
+    device: torch.device,
+    batch_size: int,
+    segment_frames: int,
+    segment_stride: int,
+    criterion: nn.Module,
+) -> Dict[str, float]:
+    model.eval()
+    total_loss = 0.0
+    total_batches = 0
+    counts = {
+        "frame": [0.0, 0.0, 0.0],
+        "onset": [0.0, 0.0, 0.0],
+        "decoded_frame": [0.0, 0.0, 0.0],
+        "decoded_onset": [0.0, 0.0, 0.0],
+    }
+    macro_f1_totals = {f"state_{state}_f1": 0.0 for state in range(4)}
+    macro_f1_totals["state_macro_f1"] = 0.0
+
+    for xb, yb, mb in iterate_state4_batches(
+        files=files,
+        batch_size=batch_size,
+        segment_frames=segment_frames,
+        segment_stride=segment_stride,
+        shuffle_files=False,
+    ):
+        xb = xb.to(device, non_blocking=True)
+        yb = yb.to(device, non_blocking=True)
+        mb = mb.to(device, non_blocking=True)
+
+        with torch.amp.autocast("cuda", dtype=torch.float16):
+            outputs = model(xb)
+            loss = state4_masked_cross_entropy_loss(
+                logits=outputs["state_logits"],
+                targets=yb,
+                mask=mb,
+                criterion=criterion,
+            )
+
+        total_loss += float(loss.item())
+        total_batches += 1
+
+        preds = outputs["state_logits"].argmax(dim=-1)
+        batch_counts = state4_metric_counts(preds, yb, mb)
+        for name, (tp, fp, fn) in batch_counts.items():
+            counts[name][0] += tp
+            counts[name][1] += fp
+            counts[name][2] += fn
+
+        macro_f1 = state4_macro_f1(preds, yb, mb)
+        for key, value in macro_f1.items():
+            macro_f1_totals[key] += value
+
+    metrics: Dict[str, float] = {"loss": total_loss / max(total_batches, 1)}
+    for prefix, (tp, fp, fn) in counts.items():
+        metrics.update(prf_from_counts(tp, fp, fn, prefix=f"{prefix}_"))
+    for key, value in macro_f1_totals.items():
+        metrics[key] = value / max(total_batches, 1)
+    return metrics

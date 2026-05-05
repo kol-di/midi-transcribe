@@ -348,6 +348,85 @@ class CRNNOnsetFrameBaseline(nn.Module):
         }
 
 
+class CRNNState4Baseline(nn.Module):
+    """CRNN single-head baseline for per-note 4-state classification."""
+
+    def __init__(
+        self,
+        out_keys: int = 88,
+        num_states: int = 4,
+        hidden_channels: int = 96,
+        pooled_freq_bands: int = 16,
+        head_hidden: int = 256,
+        dropout: float = 0.2,
+        rnn_type: str = "gru",
+        rnn_input_dim: int = 256,
+        rnn_hidden_size: int = 128,
+        rnn_num_layers: int = 2,
+        rnn_bidirectional: bool = True,
+    ) -> None:
+        super().__init__()
+
+        if rnn_type not in {"lstm", "gru"}:
+            raise ValueError(f"rnn_type must be 'lstm' or 'gru', got {rnn_type}")
+
+        self.out_keys = out_keys
+        self.num_states = num_states
+        self.pooled_freq_bands = pooled_freq_bands
+        self.encoder = CNNFrequencyEncoder(hidden_channels=hidden_channels)
+
+        feature_dim = hidden_channels * pooled_freq_bands
+        self.input_projection = nn.Sequential(
+            nn.Linear(feature_dim, rnn_input_dim),
+            nn.LayerNorm(rnn_input_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.1),
+        )
+
+        rnn_cls = nn.LSTM if rnn_type == "lstm" else nn.GRU
+        self.rnn = rnn_cls(
+            input_size=rnn_input_dim,
+            hidden_size=rnn_hidden_size,
+            num_layers=rnn_num_layers,
+            batch_first=True,
+            bidirectional=rnn_bidirectional,
+            dropout=dropout if rnn_num_layers > 1 else 0.0,
+        )
+
+        rnn_output_dim = rnn_hidden_size * (2 if rnn_bidirectional else 1)
+        self.rnn_output_dropout = nn.Dropout(dropout)
+        self.rnn_output_norm = nn.LayerNorm(rnn_output_dim)
+
+        self.state_head = nn.Sequential(
+            nn.Linear(rnn_output_dim, head_hidden),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(head_hidden, out_keys * num_states),
+        )
+
+    def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        # x: [B, T, F] -> [B, 1, F, T]
+        x = x.transpose(1, 2).unsqueeze(1)
+
+        h = self.encoder(x)  # [B, C, F_reduced, T]
+        h = nn.functional.adaptive_avg_pool2d(h, (self.pooled_freq_bands, h.shape[-1]))
+        h = h.permute(0, 3, 1, 2).contiguous()  # [B, T, C, F_reduced]
+        features = h.flatten(start_dim=2)  # [B, T, D]
+
+        rnn_input = self.input_projection(features)
+        rnn_features, _ = self.rnn(rnn_input)
+        rnn_features = self.rnn_output_norm(self.rnn_output_dropout(rnn_features))
+
+        state_logits = self.state_head(rnn_features)
+        state_logits = state_logits.reshape(
+            state_logits.shape[0],
+            state_logits.shape[1],
+            self.out_keys,
+            self.num_states,
+        )
+        return {"state_logits": state_logits}
+
+
 def create_model(
     model_name: str,
     input_dim: int = 128,
@@ -395,5 +474,19 @@ def create_model(
             rnn_num_layers=rnn_num_layers,
             rnn_bidirectional=rnn_bidirectional,
             onset_head_source=crnn_onset_head_source,
+        )
+    if model_name == "crnn_state4":
+        return CRNNState4Baseline(
+            out_keys=output_dim,
+            num_states=4,
+            hidden_channels=96,
+            pooled_freq_bands=pooled_freq_bands,
+            head_hidden=hidden_dim,
+            dropout=0.2,
+            rnn_type=rnn_type,
+            rnn_input_dim=rnn_input_dim,
+            rnn_hidden_size=rnn_hidden_size,
+            rnn_num_layers=rnn_num_layers,
+            rnn_bidirectional=rnn_bidirectional,
         )
     raise ValueError(f"Unknown model_name: {model_name}")
